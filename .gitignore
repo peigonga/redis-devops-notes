@@ -24,3 +24,5 @@ hs_err_pid*
 
 .idea/*
 /out
+/target
+/src/main/resources/conf/conf.properties
