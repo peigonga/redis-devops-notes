@@ -131,3 +131,75 @@ failover-timeout的作用体现在四个方面
 2. 通过sentinel get-master-addr-by-name获取对应主节点的信息
 3. 验证当前获取的主节点是真正的主节点
 4. 保持和Sentinel节点集合的联系，时可获取关于主节点的相关信息
+
+### 实现原理
+#### 三个定时监控任务
+一套合理的监控机制是Sentinel节点判定节点不可达的重要保证，Redis Sentinel通过
+三个定时监控任务完成对各节点的发现和监控
+1. 每隔10秒，每隔Sentinel节点会向主节点和从节点发送info命令获取最新的拓扑结构，
+   具体作用表现在三个方面
+    - 通过向主节点执行info命令，获取从节点信息，这也是sentinel节点不需要显示配置监控从节点
+    - 当有新的从节点加入时都可以立刻感知出来
+    - 节点不可达或故障转移后，可以通过info命令实时更新节点拓扑信息
+2. 每隔2秒，每个sentinel节点会向Redis数据节点的__sentinel__:hello频道上发送
+   该sentinel节点对于主节点的判断以及当前sentinel节点的信息，同时每个sentinel节点
+   也会订阅该频道，来了解其他sentinel几点及它们对主节点的判断，所以这个定时任务可以
+   完成两个工作
+    - 发现新的sentinel节点
+    - sentinel节点之间交换主节点状态，作为后面客观下线以及领导者选举的依据
+3. 每隔1秒，每个Sentinel节点会向主节点、从节点、其余sentinel节点发送一条ping
+   命令做一次心跳检测，来确认这些节点当前是否可达
+
+#### 主观下线和客观下线
+- 主观下线：每个sentinel节点对其他节点进行心跳检查时，如果超过了down-after-milliseconds
+  没有进行有效回复，sentinel节点会对该节点做失败的判定，即主观下线
+- 客观下线：当sentinel主观下线的节点是主节点时，该sentinel节点会通过
+  sentinel is-master-down-by-addr命令向其他sentinel节点询问对主节点的判断，当超过
+  <quorum>个数，sentinel节点认为主节点有问题，这是该sentinel节点会做出客观下线的决定
+
+```shell script
+sentinel is-master-down-by-addr <ip> <port> <current_epoch> <runid>
+```
+- ip：主节点IP
+- port：主节点端口
+- current_epoch：当前配置纪元
+- runid：
+    1. 为*时，作用是sentinel节点直接交换对主节点下线的判断
+    2. 为当前sentinel节点的runid时，作用是当前sentinel节点希望目标节点同意自己成为
+       领导者的请求
+
+返回结果三个三处
+- down_state：目标sentinel节点对于主节点下线的判断，0-下线，1-在线
+- leader_runid：
+    1. 为*时，返回结果是主节点是否可达
+    2. 为具体的runid时，代表是否同意runid成为领导者
+- leader_epoch：领导者纪元
+
+#### 领导者Sentinel选取
+使用Raft算法实现领导者选举，大致思路如下
+1. 每个在线的sentinel节点都有资格称为领导者，当他确认主节点主观下线时，会向
+   其他sentinel节点发送sentinel is-master-down-by-addr命令，要求将自己
+   设置为领导者
+2. 收到命令的sentinel节点，如果没有同意过其他sentinel节点的
+   sentinel is-master-down-by-addr命令，将同意该请求，否则拒绝
+3. 如果该sentinel节点发现自己的票数大于等于max(quorum, num(sentinels) / 2 + 1)，
+   那么它将成为领导者
+4. 如果此过程没有选举出领导者，将进入下一次选举
+
+#### 故障转移
+领导者sentinel福则故障转移，具体步骤如下：
+1. 在从节点列表中选出一个节点作为新的主节点
+    1. 过滤：不健康(主观下线、断线)、5秒内没有回复过sentinel节点ping相应、
+        与主节点失联超过down-after-milliseconds*10秒
+    2. 选择slave-priority最高的从节点列表，如果存在则返回，不存在继续
+    3. 选择复制偏移量最大的从节点(复制最完整的)，如果存在则返回，否则继续
+    4. 选取runid最小的
+2. 领导者节点会对第一步选出的从节点执行slaveof no one命令让其成为主节点
+3. 领导者节点会向剩余的从节点发送命令，让他们成为新主节点的从节点，复制规则和parallel-syncs
+   参数有关
+4. sentinel节点集合会将原来的主节点更新为从节点，并保持着对其关注，当其回复后命令它去
+   复制新的主节点
+   
+#### 高可用读写分离
+设计思路：主要能够实时掌握所有从节点的状态，把所有从节点看作一个资源池，无论是上线
+还是下线从节点，客户端都能及时感知到，这样从节点德高可用目标就达到了，
